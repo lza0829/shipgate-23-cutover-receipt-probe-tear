@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS releases (
   admitted_at TEXT,
   released_at TEXT,
   rolled_back_at TEXT,
+  rollback_version TEXT,
   FOREIGN KEY(app_id) REFERENCES apps(id),
   FOREIGN KEY(current_env_id) REFERENCES environments(id)
 );
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS switch_ledger (
   attached_count INTEGER NOT NULL DEFAULT 1,
   outcome TEXT NOT NULL DEFAULT '',
   gap_mark TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT '已切',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   replayed_count INTEGER NOT NULL DEFAULT 0,
@@ -217,6 +219,16 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             """
         )
         conn.execute("DROP TABLE instances_old")
+    # 回滚目标版本独立成列：不得改写 target_version，否则发版详情「目标版本」
+    # 与名册当前列会长期双账。
+    rel_cols = _columns(conn, "releases")
+    if "rollback_version" not in rel_cols:
+        conn.execute("ALTER TABLE releases ADD COLUMN rollback_version TEXT")
+    ledger_cols = _columns(conn, "switch_ledger")
+    if "state" not in ledger_cols:
+        conn.execute(
+            "ALTER TABLE switch_ledger ADD COLUMN state TEXT NOT NULL DEFAULT '已切'"
+        )
     conn.commit()
 
 

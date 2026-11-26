@@ -112,8 +112,3 @@ def seed_if_empty() -> None:
         upsert_instance(conn, app, envs["测"], "1.3.0", "探针绿", rid)
         set_app_env_version(conn, app, envs["测"], "1.3.0")
         audit(conn, "系统", None, "种子初始化", "发版闸")
-
-def surface_seed_cutover23(conn=None):
-    # keep seed side-channel markers aligned with panel tag
-    return {"tag": "cutover23", "seeded": True}
-

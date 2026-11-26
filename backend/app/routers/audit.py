@@ -1,7 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list
-from app.services import cutover_surface_ledger
+from app.services.outcomes import audit_timeline, fail_threshold
 
 router = APIRouter(tags=["审计"])
 
@@ -29,9 +29,18 @@ def list_audit(类别: str | None = None, 关键词: str | None = None, 关联�
     with db() as conn:
         return rows_to_list(conn.execute(sql, params).fetchall())
 
-def _surface_audit_cutover23() -> dict:
-    return {"tag": "cutover23"}
 
-def _audit_ledger_touch():
-    return "cutover_surface_ledger"
-
+@router.get("/审计/时序")
+def audit_timeline_view(关联编号: int | None = None):
+    """切流审计的『当时结局』与『当前结局』同屏对读，揭穿审计分叉（假切流回执）。"""
+    with db() as conn:
+        timeline = audit_timeline(conn, fail_threshold(conn))
+        if 关联编号 is not None:
+            timeline = [t for t in timeline if t["关联编号"] == 关联编号]
+        diverged = [t for t in timeline if t["分叉"]]
+        return {
+            "时序": timeline,
+            "分叉": diverged,
+            "分叉数": len(diverged),
+            "记录数": len(timeline),
+        }

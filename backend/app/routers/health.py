@@ -5,14 +5,13 @@ from app.db import db
 from app.services.common import audit, now_str
 from app.services.outcomes import (
     INSTANCE_SELECT,
+    POLICY_LABEL,
     evaluate_slot,
     fail_threshold,
     query_instance_views,
     refresh_ledger_for_version,
     view_instance,
 )
-from app.services import cutover_surface
-
 router = APIRouter(tags=["健康"])
 
 
@@ -97,6 +96,74 @@ def register_instance(body: InstanceIn):
         return view_instance(row, threshold, slot)
 
 
+@router.get("/探针/对照")
+def probe_roster_compare(应用编号: int | None = None, 环境: str | None = None):
+    """健康探针字段与名册切流列同屏对读。
+
+    一行同时给出：名册当前版本/环境列、同版本探针行的健康/连续失败、
+    切流事件与审计是否同核，以及切流成功灯。前端「健康页」与「切流页」
+    都用同一行数据，不得各算一套。
+    """
+    with db() as conn:
+        threshold = fail_threshold(conn)
+        sql = """
+            SELECT v.app_id AS 应用编号, v.env_id AS 环境编号
+            FROM app_env_versions v
+            JOIN apps a ON a.id=v.app_id
+            JOIN environments e ON e.id=v.env_id
+            WHERE 1=1
+        """
+        params: list = []
+        if 应用编号 is not None:
+            sql += " AND v.app_id=?"
+            params.append(应用编号)
+        if 环境:
+            sql += " AND e.code=?"
+            params.append(环境)
+        sql += " ORDER BY a.id, e.sort_order"
+        rows = conn.execute(sql, params).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            slot = evaluate_slot(conn, r["应用编号"], r["环境编号"], threshold=threshold)
+            ev = slot.get("切流证据") or {}
+            probe_rows = slot.get("实例", [])
+            out.append({
+                "应用编号": r["应用编号"],
+                "环境编号": r["环境编号"],
+                "应用": slot["应用"],
+                "环境": slot["环境"],
+                "名册环境列": slot["环境"],
+                "名册版本": slot["名册版本"],
+                "名册产版本": slot["名册产版本"],
+                "名册更新时间": slot["名册更新时间"],
+                "核对版本": slot["核对版本"],
+                "探针行": [
+                    {
+                        "实例编号": p["编号"],
+                        "版本": p["版本"],
+                        "健康": p["健康"],
+                        "连续失败次数": p["连续失败次数"],
+                        "阈值": p["阈值"],
+                        "发版单编号": p["发版单编号"],
+                        "补挂": p["挂接补登"],
+                    }
+                    for p in probe_rows
+                ],
+                "探针过线": bool(ev.get("探针过线")),
+                "名册已切": bool(ev.get("名册已切")),
+                "切流事件": bool(ev.get("切流事件")),
+                "审计切流": bool(ev.get("审计切流")),
+                "缺证": ev.get("缺证", []),
+                "结局": slot["结局"],
+                "缺口标": slot["缺口标"],
+                "证据缺口标": slot.get("证据缺口标", ""),
+                "切流状态": slot.get("切流状态", ""),
+                "切流成功": bool(slot.get("切流成功")),
+                "阈值": threshold,
+            })
+        return {"对照": out, "阈值": threshold, "策略": POLICY_LABEL}
+
+
 @router.post("/实例/{instance_id}/健康")
 def set_health(instance_id: int, body: HealthIn):
     if body.健康 not in ("探针绿", "探针红", "探针待报"):
@@ -142,13 +209,3 @@ def set_health(instance_id: int, body: HealthIn):
         audit(conn, "探针", instance_id, body.健康, note)
 
         return view_instance(fresh, threshold, slot)
-
-def _health_panel_cutover23(conn=None):
-    if conn is None:
-        return {"panel": "cutover23"}
-    try:
-        last = cutover_surface.get_json(conn, "surface_last", {}) or {}
-        return {"panel": "cutover23", "release_id": last.get("release_id"), "ok": bool(last.get("ok"))}
-    except Exception:
-        return {"panel": "cutover23"}
-

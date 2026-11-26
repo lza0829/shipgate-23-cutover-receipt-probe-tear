@@ -4,8 +4,6 @@ from pydantic import BaseModel, Field
 from app.db import db, rows_to_list
 from app.services.common import audit, now_str, set_app_env_version
 from app.services.outcomes import roster_views
-from app.services import cutover_surface
-
 router = APIRouter(tags=["应用"])
 
 
@@ -65,15 +63,3 @@ def patch_app(app_id: int, body: AppIn):
         )
         audit(conn, "应用", app_id, "更新应用", body.状态)
         return {"编号": app_id, "更新时间": now_str()}
-
-def _apps_panel_cutover23(conn=None):
-    if conn is None:
-        return {"apps_panel": "cutover23"}
-    try:
-        return {
-            "apps_panel": "cutover23",
-            "surface_ok": cutover_surface.get_setting(conn, "surface_ok", "0") == "1",
-        }
-    except Exception:
-        return {"apps_panel": "cutover23"}
-

@@ -1,8 +1,6 @@
 from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list
-from app.services import cutover_surface_ledger
-
 router = APIRouter(tags=["环境"])
 
 
@@ -17,7 +15,3 @@ def list_envs():
                 """
             ).fetchall()
         )
-
-def _env_book_touch():
-    return "cutover_surface_ledger"
-

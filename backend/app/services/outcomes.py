@@ -52,6 +52,22 @@ GAP_BY_OUTCOME = {
     NO_INSTANCE: GAP_NO_INSTANCE,
 }
 
+# 成功灯的证据缺口：探针/名册/事件/审计四件缺一整笔时必须退回，不得亮成功灯。
+GAP_EVIDENCE = "缺口·证据不全"
+GAP_ROSTER_NOT_SWITCHED = "缺口·名册未切"
+
+# 切流状态（成功灯）：只有四件同核才允许亮「切流成功」。
+CUTOVER_NONE = "未切流"
+CUTOVER_BASELINE = "基线"          # 名册有版本但从未经闸门切流（种子/手工名册）
+CUTOVER_OK = "切流成功"
+CUTOVER_FROZEN = "冻结已切"        # 切流记录在，但证据不全/探针未过 → 不得算已切
+CUTOVER_ROSTER_MISSING = "名册未切"  # 探针/事件/审计在，名册当前列尚未切
+CUTOVER_ROLLED_BACK = "已回滚"      # 回滚旁路收束，前向切流不得再亮成功灯
+
+EVIDENCE_KEYS = ("探针", "名册", "事件", "审计")
+
+PROD_ENV_CODE = "产"
+
 RED_OUTCOMES = (RED_COUNTING, RED_OVER)
 GAP_OUTCOMES = (RED_COUNTING, RED_OVER, PENDING, NO_INSTANCE)
 
@@ -99,6 +115,147 @@ JOIN environments e ON e.id = i.env_id
 """
 
 
+def _env_code(conn, env_id: int) -> str:
+    row = conn.execute("SELECT code FROM environments WHERE id=?", (env_id,)).fetchone()
+    return row["code"] if row else ""
+
+
+def _probe_state(conn, app_id: int, env_id: int, version: str, threshold: int) -> dict:
+    """核对指定版本的探针是否过线：有同版本实例且全部探针绿。"""
+    rows = conn.execute(
+        INSTANCE_SELECT + " WHERE i.app_id=? AND i.env_id=? AND i.version=?",
+        (app_id, env_id, version),
+    ).fetchall()
+    total = len(rows)
+    green = sum(1 for r in rows if r["健康"] == "探针绿")
+    passed = total > 0 and green == total
+    return {"实例总数": total, "绿数": green, "过线": passed}
+
+
+def _latest_forward_event(conn, app_id: int, env_id: int, version: str | None = None):
+    """最近一次『放行』切流事件；version 给定时只认目标版本与之一致的单。"""
+    sql = """
+        SELECT pe.id AS event_id, pe.release_id AS rid, pe.created_at AS at,
+               r.target_version AS target, r.status AS status,
+               r.rollback_version AS rollback_version
+        FROM promote_events pe JOIN releases r ON r.id = pe.release_id
+        WHERE r.app_id=? AND pe.to_env_id=? AND pe.decision='放行'
+    """
+    params: list = [app_id, env_id]
+    if version is not None:
+        sql += " AND r.target_version=?"
+        params.append(version)
+    sql += " ORDER BY pe.id DESC LIMIT 1"
+    return conn.execute(sql, params).fetchone()
+
+
+def _has_switch_audit(conn, release_id: int, version: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT id FROM audit_events
+        WHERE kind='切流' AND ref_id=? AND note LIKE ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (release_id, f"%名册产版本={version}%"),
+    ).fetchone()
+    return row is not None
+
+
+def cutover_evidence(conn, app_id: int, env_id: int, version: str | None = None,
+                     threshold: int | None = None, slot: dict | None = None) -> dict:
+    """切流成功灯的单一证据核心：探针 ∪ 名册 ∪ 事件 ∪ 审计 必须同核。
+
+    成功灯只能由「健康探针过线 ∧ 名册环境列已切 ∧ 切流事件同核 ∧ 审计同核」
+    重放得出；缺一整笔就退回（冻结已切），且切流桶不得计为已切。
+    只对生产环境（产）计成功灯，避免非生产晋升噪声混入主链。
+    """
+    if threshold is None:
+        threshold = fail_threshold(conn)
+    if slot is None:
+        slot = evaluate_slot(conn, app_id, env_id, version=version, threshold=threshold)
+    roster_version = (slot.get("名册版本") or "")
+    env_code = _env_code(conn, env_id)
+    applicable = env_code == PROD_ENV_CODE
+
+    base = {
+        "适用": applicable,
+        "名册已切": False,
+        "探针过线": False,
+        "切流事件": False,
+        "审计切流": False,
+        "证据": {k: False for k in EVIDENCE_KEYS},
+        "缺证": list(EVIDENCE_KEYS),
+        "切流状态": CUTOVER_NONE,
+        "切流成功": False,
+        "证据缺口标": "",
+        "切流目标版本": "",
+        "切流核对版本": "",
+        "切流发版单编号": None,
+        "已回滚": False,
+    }
+    if not applicable:
+        base["切流状态"] = CUTOVER_BASELINE if roster_version else CUTOVER_NONE
+        base["缺证"] = []
+        return base
+
+    intent = _latest_forward_event(conn, app_id, env_id, version)
+    if not intent:
+        # 核对版本与事件目标不符（典型是回滚后名册指向旧版本）：若最近一次
+        # 前向切流已回滚，本槽位即为『已回滚』，不得退回基线冒充成功。
+        latest = _latest_forward_event(conn, app_id, env_id, None)
+        if latest and latest["status"] == "已回滚":
+            intent = latest
+        else:
+            # 名册有版本但从未经过闸门（种子/手工名册）：基线，不冒充失败。
+            base["切流状态"] = CUTOVER_BASELINE if roster_version else CUTOVER_NONE
+            base["缺证"] = []
+            return base
+
+    target = intent["target"] or ""
+    rolled_back = intent["status"] == "已回滚"
+    # 回滚后名册应指向回滚版本；探针与名册都按该版本核对。
+    compare_version = (intent["rollback_version"] or target) if rolled_back else target
+    roster_switched = bool(compare_version) and roster_version == compare_version
+    probe = _probe_state(conn, app_id, env_id, compare_version, threshold)
+    event_ok = True  # intent 本身就是一条『放行』切流事件
+    audit_ok = _has_switch_audit(conn, intent["rid"], target)
+
+    base.update({
+        "名册已切": roster_switched,
+        "探针过线": probe["过线"],
+        "切流事件": event_ok,
+        "审计切流": audit_ok,
+        "切流目标版本": target,
+        "切流核对版本": compare_version,
+        "切流发版单编号": intent["rid"],
+        "已回滚": rolled_back,
+        "证据": {
+            "探针": probe["过线"],
+            "名册": roster_switched,
+            "事件": event_ok,
+            "审计": audit_ok,
+        },
+    })
+    base["缺证"] = [k for k in EVIDENCE_KEYS if not base["证据"][k]]
+
+    if rolled_back:
+        state = CUTOVER_ROLLED_BACK
+    elif not roster_switched:
+        state = CUTOVER_ROSTER_MISSING
+    elif probe["过线"] and event_ok and audit_ok:
+        state = CUTOVER_OK
+    else:
+        state = CUTOVER_FROZEN
+
+    base["切流状态"] = state
+    base["切流成功"] = state == CUTOVER_OK
+    if state == CUTOVER_ROSTER_MISSING:
+        base["证据缺口标"] = GAP_ROSTER_NOT_SWITCHED
+    elif state == CUTOVER_FROZEN and (not event_ok or not audit_ok):
+        base["证据缺口标"] = GAP_EVIDENCE
+    return base
+
+
 def view_instance(row, threshold: int, slot: dict | None = None) -> dict:
     d = dict(row)
     fc = int(d.get("fail_count") or 0)
@@ -113,15 +270,44 @@ def view_instance(row, threshold: int, slot: dict | None = None) -> dict:
     d["阈值超标"] = health == "探针红" and fc >= threshold
     d["挂接补登"] = bool(d.get("backfilled"))
     d["本行缺口标"] = row_gap_mark(health, fc, threshold)
-    if slot is not None:
-        # 槽位级规范字段：整站对齐用的 结局/缺口标 以槽位为准。
-        d["结局"] = slot["结局"]
-        d["缺口标"] = slot["缺口标"]
-        d["红灯已切流"] = slot["红灯已切流"]
+    # 行级结局必须按本行自己的版本核对；同槽位有旧版本残留（回滚旁路/跨环旁读）
+    # 时不得借用槽位缓存把它标成『探针全绿』。
+    row_outcome = ""
+    if health == "探针绿":
+        row_outcome = GREEN
+    elif health == "探针待报":
+        row_outcome = PENDING
+    elif fc >= threshold:
+        row_outcome = RED_OVER
     else:
-        d["结局"] = ""
+        row_outcome = RED_COUNTING
+    if slot is not None:
+        verified = row_outcome
+        roster_version = slot.get("名册版本") or ""
+        check_version = slot.get("核对版本") or roster_version
+        matches_slot = d.get("版本") == (check_version or roster_version)
+        d["名册版本一致"] = bool(matches_slot)
+        if matches_slot:
+            # 槽位级规范字段：整站对齐用的 结局/缺口标 以槽位为准。
+            verified = slot["结局"]
+            d["缺口标"] = slot["缺口标"]
+            d["红灯已切流"] = slot["红灯已切流"]
+            d["切流状态"] = slot.get("切流状态", "")
+            d["切流成功"] = bool(slot.get("切流成功"))
+        else:
+            # 跨环/残留旁读：只按本行自身证据，且明示与本槽名册版本不符。
+            d["缺口标"] = d["本行缺口标"]
+            d["红灯已切流"] = False
+            d["切流状态"] = ""
+            d["切流成功"] = False
+        d["结局"] = verified
+    else:
+        d["结局"] = row_outcome
         d["缺口标"] = d["本行缺口标"]
         d["红灯已切流"] = False
+        d["名册版本一致"] = False
+        d["切流状态"] = ""
+        d["切流成功"] = False
     return d
 
 
@@ -141,8 +327,17 @@ def evaluate_slot(conn, app_id: int, env_id: int, version: str | None = None,
         (app_id, env_id),
     ).fetchone()
     roster_version = (roster["version"] if roster else "") or ""
-    check_version = roster_version if version is None else (version or "")
     roster_updated = roster["updated_at"] if roster else None
+    if version is None:
+        check_version = roster_version
+        if not check_version:
+            # 名册环境列尚未切（如注入『跳过名册』），但切流事件已出：
+            # 仍需按事件目标版本核对探针，才能把「名册未切」显形而不是退回未切流。
+            intent = _latest_forward_event(conn, app_id, env_id)
+            if intent:
+                check_version = intent["target"] or ""
+    else:
+        check_version = version or ""
 
     slot: dict = {
         "应用编号": app_id,
@@ -172,9 +367,19 @@ def evaluate_slot(conn, app_id: int, env_id: int, version: str | None = None,
         "匹配实例数": 0,
         "失败次数": 0,
         "实例": [],
+        "切流证据": {},
+        "切流状态": CUTOVER_NONE,
+        "切流成功": False,
+        "证据缺口标": "",
+        "名册已切": False,
+        "探针过线": False,
+        "切流事件": False,
+        "审计切流": False,
+        "缺证": [],
     }
 
     if not check_version:
+        # 既无名册版本也无切流事件：纯基线/未切流，证据无需可算。
         return slot
 
     rows = conn.execute(
@@ -222,6 +427,30 @@ def evaluate_slot(conn, app_id: int, env_id: int, version: str | None = None,
         inst["结局"] = outcome
         inst["缺口标"] = slot["缺口标"]
         inst["红灯已切流"] = slot["红灯已切流"]
+        inst["名册版本一致"] = True
+
+    # 切流成功灯必须四件同核；缺口/证据缺项在此一并挂到槽位上，避免
+    # 「回执亮成功而探针红/名册未切」撕裂。
+    evidence = cutover_evidence(
+        conn, app_id, env_id, version=(check_version or None), threshold=threshold, slot=slot
+    )
+    slot["切流证据"] = evidence
+    slot["切流状态"] = evidence["切流状态"]
+    slot["切流成功"] = evidence["切流成功"]
+    slot["证据缺口标"] = evidence["证据缺口标"]
+    slot["名册已切"] = evidence["名册已切"]
+    slot["探针过线"] = evidence["探针过线"]
+    slot["切流事件"] = evidence["切流事件"]
+    slot["审计切流"] = evidence["审计切流"]
+    slot["缺证"] = evidence["缺证"]
+    if evidence["证据缺口标"]:
+        slot["是否缺口"] = True
+        if not slot["缺口标"]:
+            slot["缺口标"] = evidence["证据缺口标"]
+    for inst in instances:
+        inst["切流状态"] = slot["切流状态"]
+        inst["切流成功"] = slot["切流成功"]
+        inst["证据缺口标"] = slot["证据缺口标"]
     slot["实例"] = instances
     return slot
 
@@ -283,6 +512,13 @@ def enrich_release(conn, release: dict, threshold: int | None = None) -> dict:
     release["阈值"] = threshold
     release["探针失败次数阈值"] = threshold
     release["失败次数阈值"] = threshold
+    # 发版详情环境列与名册当前列同一口径：切流状态/证据直接来自唯一评估核心。
+    release["切流状态"] = slot["切流状态"]
+    release["切流成功"] = slot["切流成功"]
+    release["证据缺口标"] = slot["证据缺口标"]
+    release["缺证"] = slot["缺证"]
+    release["名册版本"] = slot["名册版本"]
+    release["名册已切"] = slot["名册已切"]
     release["放行结局"] = {
         k: slot[k]
         for k in (
@@ -290,6 +526,7 @@ def enrich_release(conn, release: dict, threshold: int | None = None) -> dict:
             "名册版本", "核对版本", "阈值", "探针失败次数阈值", "失败次数阈值",
             "实例总数", "匹配实例数",
             "绿数", "红灯数", "待报数", "超标数", "失败次数",
+            "切流状态", "切流成功", "证据缺口标", "缺证", "切流证据",
         )
     }
     return release
@@ -326,24 +563,26 @@ def attach_switch_instance(conn, app_id: int, env_id: int, version: str,
 
 def upsert_ledger(conn, *, switch_key: str, release_id: int, app_id: int, env_id: int,
                   version: str, attached_count: int, slot: dict,
-                  created: bool = False) -> int:
+                  created: bool = False, state: str | None = None) -> int:
     now = now_str()
+    st = state if state is not None else slot.get("切流状态", CUTOVER_NONE)
     if created:
         cur = conn.execute(
             """
             INSERT INTO switch_ledger
               (switch_key, release_id, app_id, env_id, version,
-               roster_committed, attached_count, outcome, gap_mark,
+               roster_committed, attached_count, outcome, gap_mark, state,
                created_at, updated_at, replayed_count)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(switch_key) DO UPDATE SET
                attached_count=excluded.attached_count,
                outcome=excluded.outcome,
                gap_mark=excluded.gap_mark,
+               state=excluded.state,
                updated_at=excluded.updated_at
             """,
             (switch_key, release_id, app_id, env_id, version,
-             attached_count, slot["结局"], slot["缺口标"], now, now),
+             attached_count, slot["结局"], slot["缺口标"], st, now, now),
         )
         row = conn.execute(
             "SELECT id FROM switch_ledger WHERE switch_key=?", (switch_key,)
@@ -352,10 +591,10 @@ def upsert_ledger(conn, *, switch_key: str, release_id: int, app_id: int, env_id
     conn.execute(
         """
         UPDATE switch_ledger
-        SET attached_count=?, outcome=?, gap_mark=?, updated_at=?
+        SET attached_count=?, outcome=?, gap_mark=?, state=?, updated_at=?
         WHERE switch_key=?
         """,
-        (attached_count, slot["结局"], slot["缺口标"], now, switch_key),
+        (attached_count, slot["结局"], slot["缺口标"], st, now, switch_key),
     )
     row = conn.execute(
         "SELECT id FROM switch_ledger WHERE switch_key=?", (switch_key,)
@@ -381,10 +620,11 @@ def refresh_ledger_for_version(conn, app_id: int, env_id: int, version: str,
         conn.execute(
             """
             UPDATE switch_ledger
-            SET outcome=?, gap_mark=?, attached_count=?, updated_at=?
+            SET outcome=?, gap_mark=?, attached_count=?, state=?, updated_at=?
             WHERE switch_key=?
             """,
-            (slot["结局"], slot["缺口标"], attached, now, r["switch_key"]),
+            (slot["结局"], slot["缺口标"], attached,
+             slot.get("切流状态", CUTOVER_NONE), now, r["switch_key"]),
         )
 
 
@@ -464,20 +704,28 @@ def replay_outcomes(conn, *, backfill: bool = True, bump: bool = True) -> dict:
             conn.execute(
                 """
                 UPDATE switch_ledger
-                SET outcome=?, gap_mark=?, attached_count=?, updated_at=?,
+                SET outcome=?, gap_mark=?, attached_count=?, state=?, updated_at=?,
                     replayed_count=replayed_count+1
                 WHERE id=?
                 """,
-                (slot["结局"], slot["缺口标"], slot["匹配实例数"], now, row["id"]),
+                (slot["结局"], slot["缺口标"], slot["匹配实例数"],
+                 slot.get("切流状态", CUTOVER_NONE), now, row["id"]),
             )
         else:
             conn.execute(
-                "UPDATE switch_ledger SET outcome=?, gap_mark=?, attached_count=?, updated_at=? WHERE id=?",
-                (slot["结局"], slot["缺口标"], slot["匹配实例数"], now, row["id"]),
+                """
+                UPDATE switch_ledger
+                SET outcome=?, gap_mark=?, attached_count=?, state=?, updated_at=?
+                WHERE id=?
+                """,
+                (slot["结局"], slot["缺口标"], slot["匹配实例数"],
+                 slot.get("切流状态", CUTOVER_NONE), now, row["id"]),
             )
         replayed.append(
             {"台账编号": row["id"], "switch_key": row["switch_key"],
-             "结局": slot["结局"], "缺口标": slot["缺口标"]}
+             "结局": slot["结局"], "缺口标": slot["缺口标"],
+             "切流状态": slot.get("切流状态", CUTOVER_NONE),
+             "切流成功": bool(slot.get("切流成功"))}
         )
 
     gaps = [
@@ -496,3 +744,189 @@ def replay_outcomes(conn, *, backfill: bool = True, bump: bool = True) -> dict:
         "阈值": threshold,
         "策略": POLICY_LABEL,
     }
+
+
+# ---------------------------------------------------------------------------
+# 切流差额 / 审计时序：让「回执出而探针红」「审计有健康未过」「切流桶与审计分叉」
+# 都能被同一条纯计算线揭穿。
+# ---------------------------------------------------------------------------
+
+def audit_timeline(conn, threshold: int | None = None) -> list[dict]:
+    """每条切流审计记录的『当时结局』与『当前结局』并读。
+
+    审计里存的是一次快照；切流灯只能决定在当下是否还站得住。若当时记
+    探针全绿、现在探针红/名册未切/证据缺项，这就是一条『审计分叉』。
+    """
+    if threshold is None:
+        threshold = fail_threshold(conn)
+    rows = conn.execute(
+        """
+        SELECT id AS 编号, ref_id AS 关联编号, action AS 动作,
+               created_at AS 时间, note AS 备注
+        FROM audit_events WHERE kind='切流'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    timeline: list[dict] = []
+    for r in rows:
+        rid = r["关联编号"]
+        note = r["备注"] or ""
+        recorded = ""
+        for token in note.split():
+            if token.startswith("结局="):
+                recorded = token.split("=", 1)[1]
+        release = conn.execute(
+            "SELECT app_id, current_env_id, target_version FROM releases WHERE id=?", (rid,)
+        ).fetchone()
+        current = ""
+        state = ""
+        diverged = False
+        if release and release["app_id"] and release["current_env_id"]:
+            # 审计对应的槽位以切流事件的 to_env 为准；回滚后 current_env_id
+            # 仍可能停留在被回滚环境，这里不依赖它。
+            ev = conn.execute(
+                """
+                SELECT pe.to_env_id AS env_id FROM promote_events pe
+                WHERE pe.release_id=? AND pe.decision='放行'
+                ORDER BY pe.id DESC LIMIT 1
+                """,
+                (rid,),
+            ).fetchone()
+            env_id = ev["env_id"] if ev else release["current_env_id"]
+            # 审计当时核对的是切流那一刻的版本；必须按该段自己的版本重放。
+            slot = evaluate_slot(
+                conn, release["app_id"], env_id,
+                version=release["target_version"], threshold=threshold,
+            )
+            current = slot["结局"]
+            state = slot["切流状态"]
+            ev_rec = slot.get("切流证据") or {}
+            # 分叉正是「审计当时与当下重放不一致」：
+            # 当时记绿，当下探针红/名册未切/证据缺/成功灯不亮 → 假切流回执被揭穿。
+            if recorded == GREEN:
+                diverged = (
+                    current != GREEN
+                    or bool(ev_rec.get("证据缺口标"))
+                    or bool(ev_rec.get("缺证"))
+                    or not slot.get("切流成功")
+                )
+            elif recorded and recorded != current:
+                diverged = True
+        timeline.append({
+            "编号": r["编号"],
+            "关联编号": rid,
+            "动作": r["动作"],
+            "时间": r["时间"],
+            "审计当时结局": recorded,
+            "当前结局": current,
+            "当前切流状态": state,
+            "分叉": diverged,
+            "备注": note,
+        })
+    return timeline
+
+
+def cutover_delta(conn, threshold: int | None = None) -> list[dict]:
+    """切流差额：名册当前列 vs 最新切流事件的逐槽差额。
+
+    差额行是切流桶「不计已切」的直接证据：名册未切、探针未过、证据缺、
+    已回滚收束都会在此显形，不靠前端自行推断。
+    """
+    if threshold is None:
+        threshold = fail_threshold(conn)
+    rows = conn.execute(
+        """
+        SELECT v.app_id AS 应用编号, v.env_id AS 环境编号
+        FROM app_env_versions v ORDER BY v.app_id, v.env_id
+        """
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        slot = evaluate_slot(conn, r["应用编号"], r["环境编号"], threshold=threshold)
+        ev = slot.get("切流证据") or {}
+        if not ev.get("适用"):
+            continue
+        intent_target = (ev.get("切流目标版本") or "")
+        compare_target = (ev.get("切流核对版本") or intent_target)
+        roster_version = slot.get("名册版本") or ""
+        state = slot.get("切流状态", CUTOVER_NONE)
+        delta = ""
+        if compare_target and roster_version != compare_target:
+            # 回滚半截：名册尚未切回 —— 与正常「名册未切」分开标注。
+            delta = "回滚半截" if state == CUTOVER_ROLLED_BACK else "名册未切"
+        elif state == CUTOVER_ROLLED_BACK:
+            # 回滚已收束：前向切流已收束，仍需单列在案，但不作为长期噪声差额。
+            continue
+        elif state == CUTOVER_FROZEN:
+            delta = "探针未过" if not ev.get("探针过线") else "证据缺"
+        if not delta:
+            continue
+        out.append({
+            "应用编号": r["应用编号"],
+            "环境编号": r["环境编号"],
+            "应用": slot["应用"],
+            "环境": slot["环境"],
+            "名册版本": roster_version,
+            "切流目标版本": intent_target,
+            "切流状态": state,
+            "差额": delta,
+            "结局": slot["结局"],
+            "缺口标": slot["缺口标"] if slot["是否缺口"] else ev.get("证据缺口标", ""),
+            "缺证": ev.get("缺证", []),
+            "探针过线": bool(ev.get("探针过线")),
+            "名册已切": bool(ev.get("名册已切")),
+            "切流发版单编号": ev.get("切流发版单编号"),
+        })
+    return out
+
+
+def roster_vs_release_env(conn, threshold: int | None = None) -> list[dict]:
+    """发版详情环境列 vs 名册当前列：不得长期双账。
+
+    对最近一条生产放行单比较 release.current_env_id/目标版本与名册当前列；
+    不一致即「双账」，逐行可核（不是只改一个提示词）。
+    """
+    if threshold is None:
+        threshold = fail_threshold(conn)
+    prod = conn.execute(
+        "SELECT id FROM environments WHERE code=?", (PROD_ENV_CODE,)
+    ).fetchone()
+    if not prod:
+        return []
+    rows = conn.execute(
+        """
+        SELECT r.id AS 发版单编号, r.serial AS 发版单号, r.app_id AS 应用编号,
+               r.status AS 状态, r.target_version AS 目标版本,
+               r.rollback_version AS 回滚版本, a.name AS 应用
+        FROM releases r JOIN apps a ON a.id=r.app_id
+        WHERE r.current_env_id=? AND r.status IN ('已放行','晋升中','已回滚','回滚中')
+        ORDER BY r.id DESC
+        """,
+        (prod["id"],),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        slot = evaluate_slot(conn, r["应用编号"], prod["id"], threshold=threshold)
+        roster_version = slot.get("名册版本") or ""
+        # 已回滚/回滚中的单，详情里的当前版本应是回滚版本；否则才用目标版本。
+        if r["状态"] in ("已回滚", "回滚中") and r["回滚版本"]:
+            detail_version = r["回滚版本"]
+        else:
+            detail_version = r["目标版本"] or ""
+        double = bool(roster_version) and roster_version != detail_version
+        out.append({
+            "发版单编号": r["发版单编号"],
+            "发版单号": r["发版单号"],
+            "应用": r["应用"],
+            "状态": r["状态"],
+            "发版详情版本": detail_version,
+            "发版详情环境": PROD_ENV_CODE,
+            "名册当前版本": roster_version,
+            "名册当前环境": PROD_ENV_CODE,
+            "回滚版本": r["回滚版本"] or "",
+            "双账": double,
+            "切流状态": slot.get("切流状态", CUTOVER_NONE),
+            "切流成功": bool(slot.get("切流成功")),
+        })
+    return out
+

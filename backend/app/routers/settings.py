@@ -58,7 +58,3 @@ def upsert_setting(body: SettingIn):
             "同步值": canonical_synced,
             "时间": now_str(),
         }
-
-def _settings_panel_cutover23():
-    return {"panel": "cutover23", "ready": True}
-
